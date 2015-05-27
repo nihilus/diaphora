@@ -59,7 +59,7 @@ from jkutils.factor import (FACTORS_CACHE, difference, difference_ratio,
                             primesbelow as primes)
 
 #-----------------------------------------------------------------------
-VERSION_VALUE = "1.0.3"
+VERSION_VALUE = "1.0.4"
 COPYRIGHT_VALUE="Copyright(c) 2015 Joxean Koret"
 COMMENT_VALUE="Diaphora diffing plugin for IDA version %s" % VERSION_VALUE
 
@@ -237,7 +237,6 @@ class CChooser(Choose2):
   def OnDeleteLine(self, n):
     try:
       del self.items[n]
-      self.n -= 1
     except:
       pass
     return True
@@ -364,8 +363,7 @@ class CBinDiffExporterSetup(Form):
 
   NOTE: Don't select IDA database files (.IDB, .I64) as only SQLite databases are considered.
 """
-    def_db = os.path.splitext(GetIdbPath())[0] + ".sqlite"
-    args = {'iFileSave': Form.FileInput(save=True, swidth=40, value=def_db),
+    args = {'iFileSave': Form.FileInput(save=True, swidth=40),
             'iFileOpen': Form.FileInput(open=True, swidth=40),
             'iMinEA': Form.NumericInput(tp=Form.FT_ADDR, swidth=22),
             'iMaxEA': Form.NumericInput(tp=Form.FT_ADDR, swidth=22),
@@ -379,6 +377,41 @@ class CBinDiffExporterSetup(Form):
                                                "rIgnoreSubNames",
                                                "rIgnoreAllNames"))}
     Form.__init__(self, s, args)
+    
+  def set_options(self, opts):
+    if opts.file_out is not None:
+      self.iFileSave.value = opts.file_out
+    if opts.file_in is not None:
+      self.iFileOpen.value = opts.file_in
+    self.rUseDecompiler.checked = opts.use_decompiler
+    self.rUnreliable.checked = opts.unreliable
+    self.rSlowHeuristics.checked = opts.slow
+    self.rRelaxRatio.checked = opts.relax
+    self.rExperimental.checked = opts.experimental
+    self.iMinEA.value = opts.min_ea
+    self.iMaxEA.value = opts.max_ea
+    self.rNonIdaSubs.checked = opts.ida_subs == False
+    self.rIgnoreSubNames.checked = opts.ignore_sub_names
+    self.rIgnoreAllNames.checked = opts.ignore_all_names
+    self.rFuncSummariesOnly.checked = opts.func_summaries_only
+  
+  def get_options(self):
+    opts = dict(
+      file_out = self.iFileSave.value,
+      file_in  = self.iFileOpen.value,
+      use_decompiler = self.rUseDecompiler.checked,
+      unreliable = self.rUnreliable.checked,
+      slow = self.rSlowHeuristics.checked,
+      relax = self.rRelaxRatio.checked,
+      experimental = self.rExperimental.checked,
+      min_ea = self.iMinEA.value,
+      max_ea = self.iMaxEA.value,
+      ida_subs = self.rNonIdaSubs.checked == False,
+      ignore_sub_names = self.rIgnoreSubNames.checked,
+      ignore_all_names = self.rIgnoreAllNames.checked,
+      func_summaries_only = self.rFuncSummariesOnly.checked
+    )
+    return BinDiffOptions(**opts)
 
 #-----------------------------------------------------------------------
 try:
@@ -536,6 +569,10 @@ class CBinDiff:
     self.open_db()
     self.matched1 = set()
     self.matched2 = set()
+    
+    self.total_functions1 = None
+    self.total_functions2 = None
+    self.equal_callgraph = False
 
     self.kfh = CKoretFuzzyHashing()
     # With this block size we're sure it will only apply to functions
@@ -645,7 +682,8 @@ class CBinDiff:
                         tarjan_topological_sort text,
                         strongly_connected_spp text,
                         clean_assembly text,
-                        clean_pseudo text) """
+                        clean_pseudo text,
+                        mnemonics_spp text) """
     cur.execute(sql)
 
     sql = """ create table if not exists program (
@@ -786,6 +824,9 @@ class CBinDiff:
     sql = "create index if not exists idx_tarjan_topological_sort on functions(tarjan_topological_sort)"
     cur.execute(sql)
 
+    sql = "create index if not exists idx_mnemonics_spp on functions(mnemonics_spp)"
+    cur.execute(sql)
+
     cur.close()
 
   def add_program_data(self, type_name, key, value):
@@ -833,6 +874,10 @@ class CBinDiff:
     bb_topo_num = {}
     bb_topological = {}
     
+    mnemonics_spp = 1
+    cpu_ins_list = GetInstructionList()
+    cpu_ins_list.sort()
+
     image_base = self.get_base_address()
     for block in flow:
       nodes += 1
@@ -846,6 +891,9 @@ class CBinDiff:
       for x in list(Heads(block.startEA, block.endEA)):
         mnem = GetMnem(x)
         disasm = GetDisasm(x)
+
+        if mnem in cpu_ins_list:
+          mnemonics_spp += self.primes[cpu_ins_list.index(mnem)]
 
         try:
           assembly[block_ea].append(disasm)
@@ -968,7 +1016,7 @@ class CBinDiff:
              proto, cc, prime, f, comment, true_name, bytes_hash, pseudo, pseudo_lines,
              pseudo_hash1, pseudocode_primes, function_flags, asm, proto2,
              pseudo_hash2, pseudo_hash3, len(strongly_connected), loops, rva, bb_topological,
-             strongly_connected_spp, clean_assembly, clean_pseudo,
+             strongly_connected_spp, clean_assembly, clean_pseudo, mnemonics_spp,
              basic_blocks_data, bb_relations)
 
   def get_base_address(self):
@@ -997,6 +1045,10 @@ class CBinDiff:
     return rowid
 
   def save_function(self, props):
+    # XXX: FIXME: TODO: Insert relations (xrefs) between instructions
+    # too. It will allow, in the future, to create the reader for some
+    # devices...
+
     cur = self.db_cursor()
     new_props = []
     for prop in props[:len(props)-2]:
@@ -1017,10 +1069,10 @@ class CBinDiff:
                                     function_flags, assembly, prototype2, pseudocode_hash2,
                                     pseudocode_hash3, strongly_connected, loops, rva,
                                     tarjan_topological_sort, strongly_connected_spp,
-                                    clean_assembly, clean_pseudo)
+                                    clean_assembly, clean_pseudo, mnemonics_spp)
                                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                        ?, ?)"""
+                                        ?, ?, ?)"""
     cur.execute(sql, new_props)
     func_id = cur.lastrowid
 
@@ -1338,12 +1390,14 @@ class CBinDiff:
       return asm
 
     tmp = asm.split(";")[0]
+    tmp = asm.split(" # ")[0]
     # Now, replace sub_, byte_, word_, dword_, loc_, etc...
     for rep in CMP_REPS:
       tmp = re.sub(rep + "[a-f0-9A-F]+", "XXXX", tmp)
     reps = ["\+[a-f0-9A-F]+h\+"]
     for rep in reps:
       tmp = re.sub(rep, "+XXXX+", tmp)
+    tmp = re.sub("\.\.[a-f0-9A-F]{8}", "XXX", tmp)
     return tmp
 
   def compare_graphs_pass(self, bblocks1, bblocks2, colours1, colours2, is_second = False):
@@ -1706,7 +1760,7 @@ class CBinDiff:
   def check_callgraph(self):
     cur = self.db_cursor()
     sql = """select callgraph_primes, callgraph_all_primes from program
-              union
+             union all
              select callgraph_primes, callgraph_all_primes from diff.program"""
     cur.execute(sql)
     rows = cur.fetchall()
@@ -1717,7 +1771,9 @@ class CBinDiff:
       cg_factors2 = json.loads(rows[1][1])
 
       if cg1 == cg2:
-        Warning("Callgraph signature for both databases is equal, the program seems to be 100% equal structurally")
+        self.equal_callgraph = True
+        log("Callgraph signature for both databases is equal, the programs seem to be 100% equal structurally")
+        Warning("Callgraph signature for both databases is equal, the programs seem to be 100% equal structurally")
       else:
         FACTORS_CACHE[cg1] = cg_factors1
         FACTORS_CACHE[cg2] = cg_factors2
@@ -1725,10 +1781,24 @@ class CBinDiff:
         total = sum(cg_factors1.values())
         percent = diff * 100. / total
         log("Callgraphs from both programs differ in %f%%" % percent)
+
     cur.close()
 
   def find_equal_matches(self):
     cur = self.db_cursor()
+    # Start by calculating the total number of functions in both databases
+    sql = """select count(*) total1 from functions
+             union all
+             select count(*) total2 from diff.functions"""
+    cur.execute(sql)
+    rows = cur.fetchall()
+    if len(rows) != 2:
+      Warning("Malformed database, only %d rows!" % len(rows))
+      raise Exception("Malformed database!")
+
+    self.total_functions1 = rows[0][0]
+    self.total_functions2 = rows[1][0]
+
     sql = "select address, mangled_function from (select * from functions intersect select * from diff.functions) x"
     cur.execute(sql)
     rows = cur.fetchall()
@@ -1741,6 +1811,9 @@ class CBinDiff:
         choose.add_item(CChooser.Item(ea, name, ea2, name, "100% equal", 1))
         self.matched1.add(name)
         self.matched2.add(name)
+
+    if self.equal_callgraph and not self.ignore_all_names:
+      self.find_same_name(self.partial_chooser)
 
     sql = """select f.address, f.name, df.address, df.name, 'Equal pseudo-code' description
                from functions f,
@@ -1904,9 +1977,20 @@ class CBinDiff:
     r = max(v1, v2, v3)
     return r
 
+  def all_functions_matched(self):
+    return len(self.matched1) == self.total_functions1 or \
+           len(self.matched2) == self.total_functions2
+
   def add_matches_from_query_ratio(self, sql, best, partial, unreliable=None):
+    if self.all_functions_matched():
+      return
+
     cur = self.db_cursor()
-    cur.execute(sql)
+    try:
+      cur.execute(sql)
+    except:
+      log("Error: %s" % str(sys.exc_info()[1]))
+      return
 
     i = 0
     t = time.time()
@@ -1958,8 +2042,15 @@ class CBinDiff:
     cur.close()
 
   def add_matches_from_query_ratio_max(self, sql, best, partial, val):
+    if self.all_functions_matched():
+      return
+    
     cur = self.db_cursor()
-    cur.execute(sql)
+    try:
+      cur.execute(sql)
+    except:
+      log("Error: %s" % str(sys.exc_info()[1]))
+      return
 
     i = 0
     t = time.time()
@@ -2009,8 +2100,15 @@ class CBinDiff:
 
   def add_matches_from_query(self, sql, choose):
     """ Warning: use this *only* if the ratio is known to be 1.00 """
+    if self.all_functions_matched():
+      return
+    
     cur = self.db_cursor()
-    cur.execute(sql)
+    try:
+      cur.execute(sql)
+    except:
+      log("Error: %s" % str(sys.exc_info()[1]))
+      return
 
     i = 0
     while 1:
@@ -2072,56 +2170,58 @@ class CBinDiff:
     cur.close()
     return
 
+  def find_same_name(self, choose):
+    cur = self.db_cursor()
+    sql = """select f.address, f.mangled_function, d.address, f.name, d.name, d.mangled_function,
+                    f.pseudocode, d.pseudocode,
+                    f.assembly, d.assembly,
+                    f.pseudocode_primes, d.pseudocode_primes
+               from functions f,
+                    diff.functions d
+              where (d.mangled_function = f.mangled_function
+                  or d.name = f.name)"""
+    log_refresh("Finding with heuristic 'Same name'")
+    cur.execute(sql)
+    rows = cur.fetchall()
+    cur.close()
+
+    if len(rows) > 0 and not self.all_functions_matched():
+      for row in rows:
+        ea = row[0]
+        name = row[1]
+        ea2 = row[2]
+        name1 = row[3]
+        name2 = row[4]
+        name2_1 = row[5]
+        if name in self.matched1 or name1 in self.matched1 or \
+           name2 in self.matched2 or name2_1 in self.matched2:
+          continue
+
+        if self.ignore_sub_names and name.startswith("sub_"):
+          continue
+
+        ast1 = row[10]
+        ast2 = row[11]
+        pseudo1 = row[6]
+        pseudo2 = row[7]
+        asm1 = row[8]
+        asm2 = row[9]
+        ratio = self.check_ratio(ast1, ast2, pseudo1, pseudo2, asm1, asm2)
+        if float(ratio) == 1.0:
+          self.best_chooser.add_item(CChooser.Item(ea, name, ea2, name, "Perfect match, same name", 1))
+        else:
+          choose.add_item(CChooser.Item(ea, name, ea2, name, "Perfect match, same name", ratio))
+
+        self.matched1.add(name)
+        self.matched1.add(name1)
+        self.matched2.add(name2)
+        self.matched2.add(name2_1)
+
   def find_matches(self):
     choose = self.partial_chooser
 
-    if not self.ignore_all_names:
-      cur = self.db_cursor()
-      sql = """select f.address, f.mangled_function, d.address, f.name, d.name, d.mangled_function,
-                      f.pseudocode, d.pseudocode,
-                      f.assembly, d.assembly,
-                      f.pseudocode_primes, d.pseudocode_primes
-                 from functions f,
-                      diff.functions d
-                where (d.mangled_function = f.mangled_function
-                    or d.name = f.name)"""
-      log_refresh("Finding with heuristic 'Same name'")
-      cur.execute(sql)
-      rows = cur.fetchall()
-      cur.close()
-
-      if len(rows) > 0:
-        for row in rows:
-          ea = row[0]
-          name = row[1]
-          ea2 = row[2]
-          name1 = row[3]
-          name2 = row[4]
-          name2_1 = row[5]
-          if name in self.matched1 or name1 in self.matched1 or \
-             name2 in self.matched2 or name2_1 in self.matched2:
-            continue
-
-          if self.ignore_sub_names and name.startswith("sub_"):
-            continue
-
-          ast1 = row[10]
-          ast2 = row[11]
-          pseudo1 = row[6]
-          pseudo2 = row[7]
-          asm1 = row[8]
-          asm2 = row[9]
-          ratio = self.check_ratio(ast1, ast2, pseudo1, pseudo2, asm1, asm2)
-
-          if float(ratio) == 1.0:
-            self.best_chooser.add_item(CChooser.Item(ea, name, ea2, name, "Perfect match, same name", 1))
-          else:
-            choose.add_item(CChooser.Item(ea, name, ea2, name, "Perfect match, same name", ratio))
-
-          self.matched1.add(name)
-          self.matched1.add(name1)
-          self.matched2.add(name2)
-          self.matched2.add(name2_1)
+    if not self.equal_callgraph and not self.ignore_all_names:
+      self.find_same_name(choose)
 
     sql = """select f.address, f.name, df.address, df.name,
                     'All attributes' description,
@@ -2256,6 +2356,19 @@ class CBinDiff:
                  and f.names = df.names
                  and f.names != '[]'"""
     log_refresh("Finding with heuristic 'Mnemonics and names'")
+    self.add_matches_from_query_ratio(sql, choose, choose)
+
+    sql = """ select f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Mnemonics small-primes-product' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes
+                from functions f,
+                     diff.functions df
+               where f.mnemonics_spp = df.mnemonics_spp
+                 and f.instructions = df.instructions
+                 and df.instructions > 5"""
+    log_refresh("Finding with heuristic 'Mnemonics small-primes-product'")
     self.add_matches_from_query_ratio(sql, choose, choose)
 
     # Search using some of the previous criterias but calculating the
@@ -2458,37 +2571,6 @@ class CBinDiff:
     log_refresh("Finding with heuristic 'Same nodes, edges and strongly connected components'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, choose, self.unreliable_chooser)
 
-    sql = """ select f.address, f.name, df.address, df.name,
-                     'Same graph' description,
-                     f.pseudocode, df.pseudocode,
-                     f.assembly, df.assembly,
-                     f.pseudocode_primes, df.pseudocode_primes
-                from functions f,
-                     diff.functions df
-               where f.nodes = df.nodes 
-                 and f.edges = df.edges
-                 and f.indegree = df.indegree
-                 and f.outdegree = df.outdegree
-                 and f.cyclomatic_complexity = df.cyclomatic_complexity
-                 and f.strongly_connected = df.strongly_connected
-                 and f.loops = df.loops
-                 and f.tarjan_topological_sort = df.tarjan_topological_sort
-                 and f.strongly_connected_spp = df.strongly_connected_spp
-               order by
-                     case when f.size = df.size then 1 else 0 end +
-                     case when f.instructions = df.instructions then 1 else 0 end +
-                     case when f.mnemonics = df.mnemonics then 1 else 0 end +
-                     case when f.names = df.names then 1 else 0 end +
-                     case when f.prototype2 = df.prototype2 then 1 else 0 end +
-                     case when f.primes_value = df.primes_value then 1 else 0 end +
-                     case when f.bytes_hash = df.bytes_hash then 1 else 0 end +
-                     case when f.pseudocode_hash1 = df.pseudocode_hash1 then 1 else 0 end +
-                     case when f.pseudocode_primes = df.pseudocode_primes then 1 else 0 end +
-                     case when f.pseudocode_hash2 = df.pseudocode_hash2 then 1 else 0 end +
-                     case when f.pseudocode_hash3 = df.pseudocode_hash3 then 1 else 0 end DESC"""
-    log_refresh("Finding with heuristic 'Same graph'")
-    self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
-
   def find_experimental_matches(self):
     choose = self.unreliable_chooser
     if self.slow_heuristics:
@@ -2554,6 +2636,40 @@ class CBinDiff:
                   and df.names != '[]'"""
     log_refresh("Finding with heuristic 'Same low complexity and names'")
     self.add_matches_from_query_ratio_max(sql, self.partial_chooser, choose, 0.5)
+  
+    if self.slow_heuristics:
+      # For large databases (>25k functions) it may cause, for a reason,
+      # the following error: OperationalError: database or disk is full
+      sql = """ select f.address, f.name, df.address, df.name,
+                 'Same graph' description,
+                 f.pseudocode, df.pseudocode,
+                 f.assembly, df.assembly,
+                 f.pseudocode_primes, df.pseudocode_primes
+            from functions f,
+                 diff.functions df
+           where f.nodes = df.nodes 
+             and f.edges = df.edges
+             and f.indegree = df.indegree
+             and f.outdegree = df.outdegree
+             and f.cyclomatic_complexity = df.cyclomatic_complexity
+             and f.strongly_connected = df.strongly_connected
+             and f.loops = df.loops
+             and f.tarjan_topological_sort = df.tarjan_topological_sort
+             and f.strongly_connected_spp = df.strongly_connected_spp
+           order by
+                 case when f.size = df.size then 1 else 0 end +
+                 case when f.instructions = df.instructions then 1 else 0 end +
+                 case when f.mnemonics = df.mnemonics then 1 else 0 end +
+                 case when f.names = df.names then 1 else 0 end +
+                 case when f.prototype2 = df.prototype2 then 1 else 0 end +
+                 case when f.primes_value = df.primes_value then 1 else 0 end +
+                 case when f.bytes_hash = df.bytes_hash then 1 else 0 end +
+                 case when f.pseudocode_hash1 = df.pseudocode_hash1 then 1 else 0 end +
+                 case when f.pseudocode_primes = df.pseudocode_primes then 1 else 0 end +
+                 case when f.pseudocode_hash2 = df.pseudocode_hash2 then 1 else 0 end +
+                 case when f.pseudocode_hash3 = df.pseudocode_hash3 then 1 else 0 end DESC"""
+      log_refresh("Finding with heuristic 'Same graph'")
+      self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
   def find_unreliable_matches(self):
     choose = self.unreliable_chooser
@@ -2633,7 +2749,7 @@ class CBinDiff:
                  where f.nodes = df.nodes
                    and f.edges = df.edges
                    and f.cyclomatic_complexity = df.cyclomatic_complexity
-                   and f.nodes > 1 and f.edges > 0
+                   and f.nodes > 3 and f.edges > 2
                    and f.indegree = df.indegree
                    and f.outdegree = df.outdegree"""
       log_refresh("Finding with heuristic 'Nodes, edges, complexity, in-degree and out-degree'")
@@ -2748,7 +2864,7 @@ or selecting Edit -> Plugins -> Diaphora - Show results""")
       cur.execute("select value from diff.version")
     except:
       log("Error: %s " % sys.exc_info()[1])
-      Warning("The selected file does not like a valid SQLite exported database!")
+      Warning("The selected file does not look like a valid SQLite exported database!")
       cur.close()
       return False
 
@@ -2833,8 +2949,30 @@ def remove_file(filename):
       finally:
         cur.close()
 
+class BinDiffOptions:
+  def __init__(self, **kwargs):
+    total_functions = len(list(Functions()))
+    self.file_out = kwargs.get('file_out', os.path.splitext(GetIdbPath())[0] + ".sqlite")
+    self.file_in  = kwargs.get('file_in', '')
+    self.use_decompiler = kwargs.get('use_decompiler', True)
+    self.unreliable = kwargs.get('unreliable', True)
+    self.slow = kwargs.get('slow', True)
+    # Enable, by default, relaxed calculations on difference ratios for 
+    # 'big' databases (>20k functions)
+    self.relax = kwargs.get('relax', total_functions > 20000)
+    if self.relax:
+      Warning(MSG_RELAXED_RATIO_ENABLED)
+    self.experimental = kwargs.get('experimental', False)
+    self.min_ea = kwargs.get('min_ea', MinEA())
+    self.max_ea = kwargs.get('max_ea', MaxEA())
+    self.ida_subs = kwargs.get('ida_subs', True)
+    self.ignore_sub_names = kwargs.get('ignore_sub_names', True)
+    self.ignore_all_names = kwargs.get('ignore_all_names', False)
+    # Enable, by default, exporting only function summaries for huge dbs.
+    self.func_summaries_only = kwargs.get('func_summaries_only', total_functions > 100000)
+
 #-----------------------------------------------------------------------
-def diff_or_export():
+def _diff_or_export(use_ui, **options):
   global g_bindiff
 
   total_functions = len(list(Functions()))
@@ -2842,60 +2980,33 @@ def diff_or_export():
     Warning("No IDA database opened or no function in the database.\nPlease open an IDA database and create some functions before running this script.")
     return
 
-  x = CBinDiffExporterSetup()
-  x.Compile()
-  x.rUseDecompiler.checked = True
-  x.rUnreliable.checked = True
-  x.iMinEA.value = MinEA()
-  x.iMaxEA.value = MaxEA()
-  x.rSlowHeuristics.checked = True
-  # Enable, by default, relaxed calculations on difference ratios for 
-  # 'big' databases (>20k functions)
-  x.rRelaxRatio.checked = total_functions > 20000
-  if total_functions > 20000:
-    Warning(MSG_RELAXED_RATIO_ENABLED)
+  opts = BinDiffOptions(**options)
+  
+  if use_ui:
+    x = CBinDiffExporterSetup()
+    x.Compile()
+    x.set_options(opts)
 
-  x.rExperimental.checked = False
-  x.rNonIdaSubs.checked = False
-  x.rIgnoreSubNames.checked = True
-  x.rIgnoreAllNames.checked = False
-  # Enable, by default, exporting only function summaries for huge dbs.
-  x.rFuncSummariesOnly.checked = total_functions > 100000
-  if total_functions > 100000:
-    Warning(MSG_FUNCTION_SUMMARIES_ONLY)
+    if not x.Execute():
+      return
+    
+    opts = x.get_options()
 
-  if not x.Execute():
-    return
-
-  file_out = x.iFileSave.value
-  file_in  = x.iFileOpen.value
-  use_decompiler = x.rUseDecompiler.checked
-  unreliable = x.rUnreliable.checked
-  slow = x.rSlowHeuristics.checked
-  relax = x.rRelaxRatio.checked
-  experimental = x.rExperimental.checked
-  min_ea = x.iMinEA.value
-  max_ea = x.iMaxEA.value
-  ida_subs = x.rNonIdaSubs.checked == False
-  ignore_sub_names = x.rIgnoreSubNames.checked
-  ignore_all_names = x.rIgnoreAllNames.checked
-  func_summaries_only = x.rFuncSummariesOnly.checked
-
-  if file_out == file_in:
+  if opts.file_out == opts.file_in:
     Warning("Both databases are the same file!")
     return
-  elif file_out == "" or len(file_out) < 5:
+  elif opts.file_out == "" or len(opts.file_out) < 5:
     Warning("No output database selected or invalid filename. Please select a database file.")
     return
-  elif file_out[len(file_out)-4:].lower() in [".idb", ".i64"] or file_in[len(file_in)-4:].lower() in [".idb", ".i64"]:
+  elif opts.file_out[len(opts.file_out)-4:].lower() in [".idb", ".i64"] or opts.file_in[len(opts.file_in)-4:].lower() in [".idb", ".i64"]:
     Warning("One of the selected databases is an IDA database (IDB or I64), not a SQLite database!")
     return
-  elif file_out.lower().endswith(".til") or file_in.lower().endswith(".id0") or file_in.lower().endswith(".id1") or file_in.lower().endswith(".nam"):
+  elif opts.file_out.lower().endswith(".til") or opts.file_in.lower().endswith(".id0") or opts.file_in.lower().endswith(".id1") or opts.file_in.lower().endswith(".nam"):
     Warning("One of the selected databases is an IDA temporary file, not a SQLite database!")
     return
 
   export = True
-  if os.path.exists(file_out):
+  if os.path.exists(opts.file_out):
     ret = askyn_c(0, "Export database already exists. Do you want to overwrite it?")
     if ret == -1:
       log("Cancelled")
@@ -2907,22 +3018,22 @@ def diff_or_export():
     if export:
       if g_bindiff is not None:
         g_bindiff = None
-      remove_file(file_out)
-      log("Database %s removed" % repr(file_out))
+      remove_file(opts.file_out)
+      log("Database %s removed" % repr(opts.file_out))
 
   try:
-    bd = CBinDiff(file_out)
-    bd.use_decompiler_always = use_decompiler
-    bd.unreliable = unreliable
-    bd.slow_heuristics = slow
-    bd.relaxed_ratio = relax
-    bd.experimental = experimental
-    bd.min_ea = min_ea
-    bd.max_ea = max_ea
-    bd.ida_subs = ida_subs
-    bd.ignore_sub_names = ignore_sub_names
-    bd.ignore_all_names = ignore_all_names
-    bd.function_summaries_only = func_summaries_only
+    bd = CBinDiff(opts.file_out)
+    bd.use_decompiler_always = opts.use_decompiler
+    bd.unreliable = opts.unreliable
+    bd.slow_heuristics = opts.slow
+    bd.relaxed_ratio = opts.relax
+    bd.experimental = opts.experimental
+    bd.min_ea = opts.min_ea
+    bd.max_ea = opts.max_ea
+    bd.ida_subs = opts.ida_subs
+    bd.ignore_sub_names = opts.ignore_sub_names
+    bd.ignore_all_names = opts.ignore_all_names
+    bd.function_summaries_only = opts.func_summaries_only
     bd.max_processed_rows = MAX_PROCESSED_ROWS * max(total_functions / 20000, 1)
     bd.timeout = TIMEOUT_LIMIT * max(total_functions / 20000, 1)
 
@@ -2937,20 +3048,26 @@ def diff_or_export():
         bd.export()
       log("Database exported")
 
-    if file_in != "":
+    if opts.file_in != "":
       if os.getenv("DIAPHORA_PROFILE") is not None:
         log("*** Profiling diff ***")
         import cProfile
         profiler = cProfile.Profile()
-        profiler.runcall(bd.diff, file_in)
+        profiler.runcall(bd.diff, opts.file_in)
         profiler.print_stats(sort="time")
       else:
-        bd.diff(file_in)
+        bd.diff(opts.file_in)
   except:
     print("Error: %s" % sys.exc_info()[1])
     traceback.print_exc()
 
   return bd
+
+def diff_or_export_ui():
+  return _diff_or_export(True)
+
+def diff_or_export(**options):
+  return _diff_or_export(False, **options)
 
 if __name__ == "__main__":
   if os.getenv("DIAPHORA_AUTO") is not None:
@@ -2972,5 +3089,5 @@ if __name__ == "__main__":
 
     bd.export()
   else:
-    diff_or_export()
+    diff_or_export_ui()
 
