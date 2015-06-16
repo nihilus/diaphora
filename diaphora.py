@@ -25,7 +25,6 @@ TODO (for future versions):
 
 [ ] Heuristics based on the call graph. This is why BinDiff was/is the
     best one.
-[ ] Heuristics based on switchs (SPP with get_switch_info_ex(x).ncases?).
 [ ] Instruction-level comment porting.
 [ ] Import all names (global variables, etc...).
 
@@ -59,7 +58,7 @@ from jkutils.factor import (FACTORS_CACHE, difference, difference_ratio,
                             primesbelow as primes)
 
 #-----------------------------------------------------------------------
-VERSION_VALUE = "1.0.4"
+VERSION_VALUE = "1.0.5"
 COPYRIGHT_VALUE="Copyright(c) 2015 Joxean Koret"
 COMMENT_VALUE="Diaphora diffing plugin for IDA version %s" % VERSION_VALUE
 
@@ -69,7 +68,8 @@ PRTYPE_SEMI=0x0008
 # Used to clean-up the pseudo-code and assembly dumps in order to get
 # better comparison ratios
 CMP_REPS = ["loc_", "sub_", "qword_", "dword_", "byte_", "word_", "off_",
-            "unk_", "stru_", "dbl_"]
+            "unk_", "stru_", "dbl_", "locret_"]
+CMP_REMS = ["dword ptr ", "byte ptr ", "word ptr ", "qword ptr "]
 
 # Messages
 MSG_RELAXED_RATIO_ENABLED = """AUTOHIDE DATABASE\n<b>Relaxed ratio calculations</b> will be enabled. It will ignore many small
@@ -359,14 +359,15 @@ class CBinDiffExporterSetup(Form):
   <#Enable this option if you aren't interested in small changes#Relaxed calculations of differences ratios:{rRelaxRatio}>
   <Use experimental heuristics:{rExperimental}>
   <#Enable this option to ignore sub_* names for the 'Same name' heuristic.#Ignore automatically generated names:{rIgnoreSubNames}>
-  <#Enable this option to ignore all function names for the 'Same name' heuristic.#Ignore all function names:{rIgnoreAllNames}>{cGroup1}>
+  <#Enable this option to ignore all function names for the 'Same name' heuristic.#Ignore all function names:{rIgnoreAllNames}>
+  <#Enable this option to ignore thunk functions, nullsubs, etc....#Ignore small functions:{rIgnoreSmallFunctions}>{cGroup1}>
 
   NOTE: Don't select IDA database files (.IDB, .I64) as only SQLite databases are considered.
 """
     args = {'iFileSave': Form.FileInput(save=True, swidth=40),
             'iFileOpen': Form.FileInput(open=True, swidth=40),
-            'iMinEA': Form.NumericInput(tp=Form.FT_ADDR, swidth=22),
-            'iMaxEA': Form.NumericInput(tp=Form.FT_ADDR, swidth=22),
+            'iMinEA': Form.NumericInput(tp=Form.FT_HEX, swidth=22),
+            'iMaxEA': Form.NumericInput(tp=Form.FT_HEX, swidth=22),
             'cGroup1'  : Form.ChkGroupControl(("rUseDecompiler",
                                                "rUnreliable",
                                                "rNonIdaSubs",
@@ -375,7 +376,8 @@ class CBinDiffExporterSetup(Form):
                                                "rExperimental",
                                                "rFuncSummariesOnly",
                                                "rIgnoreSubNames",
-                                               "rIgnoreAllNames"))}
+                                               "rIgnoreAllNames",
+                                               "rIgnoreSmallFunctions"))}
     Form.__init__(self, s, args)
     
   def set_options(self, opts):
@@ -393,6 +395,7 @@ class CBinDiffExporterSetup(Form):
     self.rNonIdaSubs.checked = opts.ida_subs == False
     self.rIgnoreSubNames.checked = opts.ignore_sub_names
     self.rIgnoreAllNames.checked = opts.ignore_all_names
+    self.rIgnoreSmallFunctions.checked = opts.ignore_small_functions
     self.rFuncSummariesOnly.checked = opts.func_summaries_only
   
   def get_options(self):
@@ -409,6 +412,7 @@ class CBinDiffExporterSetup(Form):
       ida_subs = self.rNonIdaSubs.checked == False,
       ignore_sub_names = self.rIgnoreSubNames.checked,
       ignore_all_names = self.rIgnoreAllNames.checked,
+      ignore_small_functions = self.rIgnoreSmallFunctions.checked,
       func_summaries_only = self.rFuncSummariesOnly.checked
     )
     return BinDiffOptions(**opts)
@@ -541,7 +545,7 @@ def show_choosers():
 
 #-----------------------------------------------------------------------
 MAX_PROCESSED_ROWS = 1000000
-TIMEOUT_LIMIT = 60 * 2
+TIMEOUT_LIMIT = 60 * 3
 
 #-----------------------------------------------------------------------
 # Fix for people using IDASkins with very h4x0r $tYl3z like the
@@ -569,7 +573,6 @@ class CBinDiff:
     self.open_db()
     self.matched1 = set()
     self.matched2 = set()
-    
     self.total_functions1 = None
     self.total_functions2 = None
     self.equal_callgraph = False
@@ -598,7 +601,7 @@ class CBinDiff:
     ####################################################################
     # LIMITS
     #
-    # Do not run heuristics for more than 2 minutes per each 20.000
+    # Do not run heuristics for more than 3 minutes per each 20.000
     # functions.
     self.timeout = TIMEOUT_LIMIT
     # It's typical in SQL queries to get a cartesian product of the 
@@ -619,6 +622,8 @@ class CBinDiff:
     self.ignore_sub_names = True
     # Ignore any and all function names for the 'Same name' heuristic?
     self.ignore_all_names = True
+    # Ignore small functions?
+    self.ignore_small_functions = False
     ####################################################################
 
   def __del__(self):
@@ -683,7 +688,10 @@ class CBinDiff:
                         strongly_connected_spp text,
                         clean_assembly text,
                         clean_pseudo text,
-                        mnemonics_spp text) """
+                        mnemonics_spp text,
+                        switches text,
+                        function_hash text,
+                        bytes_sum integer) """
     cur.execute(sql)
 
     sql = """ create table if not exists program (
@@ -827,6 +835,15 @@ class CBinDiff:
     sql = "create index if not exists idx_mnemonics_spp on functions(mnemonics_spp)"
     cur.execute(sql)
 
+    sql = "create index if not exists idx_switches on functions(switches)"
+    cur.execute(sql)
+
+    sql = "create index if not exists idx_function_hash on functions(function_hash)"
+    cur.execute(sql)
+
+    sql = "create index if not exists idx_bytes_sum on functions(bytes_sum)"
+    cur.execute(sql)
+
     cur.close()
 
   def add_program_data(self, type_name, key, value):
@@ -846,7 +863,7 @@ class CBinDiff:
     f = int(f)
     func = get_func(f)
     flow = FlowChart(func)
-    size = func.endEA - func.startEA
+    size = 0
 
     if not self.ida_subs:
       # Unnamed function, ignore it...
@@ -866,6 +883,8 @@ class CBinDiff:
     names = set()
     
     bytes_hash = []
+    bytes_sum = 0
+    function_hash = []
     outdegree = 0
     indegree = len(list(CodeRefsTo(f, 1)))
     assembly = {}
@@ -873,7 +892,8 @@ class CBinDiff:
     bb_relations = {}
     bb_topo_num = {}
     bb_topological = {}
-    
+    switches = []
+
     mnemonics_spp = 1
     cpu_ins_list = GetInstructionList()
     cpu_ins_list.sort()
@@ -891,6 +911,7 @@ class CBinDiff:
       for x in list(Heads(block.startEA, block.endEA)):
         mnem = GetMnem(x)
         disasm = GetDisasm(x)
+        size += ItemSize(x)
 
         if mnem in cpu_ins_list:
           mnemonics_spp += self.primes[cpu_ins_list.index(mnem)]
@@ -904,7 +925,20 @@ class CBinDiff:
             assembly[block_ea] = ["loc_%x:" % x, disasm]
 
         instructions += 1
-        bytes_hash.append(chr(Byte(x)))
+        
+        decoded_size = idaapi.decode_insn(x)
+        if idaapi.cmd.Operands[0].type in [2, 5, 6, 7]:
+          decoded_size -= idaapi.cmd.Operands[0].offb
+        if idaapi.cmd.Operands[1].type in [2, 5, 6, 7]:
+          decoded_size -= idaapi.cmd.Operands[1].offb
+        if decoded_size <= 0:
+          decoded_size = 1
+
+        curr_bytes = GetManyBytes(x, decoded_size)
+        bytes_hash.append(curr_bytes)
+        bytes_sum += sum(map(ord, curr_bytes))
+
+        function_hash.append(GetManyBytes(x, ItemSize(x)))
         outdegree += len(list(CodeRefsFrom(x, 0)))
         mnems.append(mnem)
         op_value = GetOperandValue(x, 1)
@@ -922,6 +956,30 @@ class CBinDiff:
         ins_cmt1 = GetCommentEx(x, 0)
         ins_cmt2 = GetCommentEx(x, 1)
         instructions_data.append([x - image_base, mnem, disasm, ins_cmt1, ins_cmt2])
+
+        switch = get_switch_info_ex(x)
+        if switch:
+          switch_cases = switch.get_jtable_size()
+          switch_low_case = switch.lowcase
+          results = calc_switch_cases(x, switch)
+
+          # It seems that IDAPython for idaq64 has some bug when reading
+          # switch's cases. Do not attempt to read them if the 'cur_case'
+          # returned object is not iterable.
+          can_iter = False
+          switch_cases_values = set()
+          for idx in xrange(len(results.cases)):
+            cur_case = results.cases[idx]
+            if not '__iter__' in dir(cur_case):
+              break
+
+            can_iter |= True
+            for cidx in xrange(len(cur_case)):
+              case_id = cur_case[cidx]
+              switch_cases_values.add(case_id)
+
+          if can_iter:
+            switches.append([switch_cases, list(switch_cases_values)])
 
       basic_blocks_data[block_ea] = instructions_data
       bb_relations[block_ea] = []
@@ -976,9 +1034,15 @@ class CBinDiff:
         if sc[0] in bb_relations and sc[0] in bb_relations[sc[0]]:
           loops += 1
 
+    asm = []
     keys = assembly.keys()
     keys.sort()
-    asm = []
+    
+    # After sorting our the addresses of basic blocks, be sure that the
+    # very first address is always the entry point, no matter at what
+    # address it is.
+    keys.remove(f - image_base)
+    keys.insert(0, f - image_base)
     for key in keys:
       asm.extend(assembly[key])
     asm = "\n".join(asm)
@@ -989,6 +1053,8 @@ class CBinDiff:
     prime = str(self.primes[cc])
     comment = GetFunctionCmt(f, 1)
     bytes_hash = md5("".join(bytes_hash)).hexdigest()
+    function_hash = md5("".join(function_hash)).hexdigest()
+
     function_flags = GetFunctionFlags(f)
     pseudo = None
     pseudo_hash1 = None
@@ -1016,7 +1082,8 @@ class CBinDiff:
              proto, cc, prime, f, comment, true_name, bytes_hash, pseudo, pseudo_lines,
              pseudo_hash1, pseudocode_primes, function_flags, asm, proto2,
              pseudo_hash2, pseudo_hash3, len(strongly_connected), loops, rva, bb_topological,
-             strongly_connected_spp, clean_assembly, clean_pseudo, mnemonics_spp,
+             strongly_connected_spp, clean_assembly, clean_pseudo, mnemonics_spp, switches,
+             function_hash, bytes_sum,
              basic_blocks_data, bb_relations)
 
   def get_base_address(self):
@@ -1069,10 +1136,11 @@ class CBinDiff:
                                     function_flags, assembly, prototype2, pseudocode_hash2,
                                     pseudocode_hash3, strongly_connected, loops, rva,
                                     tarjan_topological_sort, strongly_connected_spp,
-                                    clean_assembly, clean_pseudo, mnemonics_spp)
+                                    clean_assembly, clean_pseudo, mnemonics_spp, switches,
+                                    function_hash, bytes_sum)
                                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                        ?, ?, ?)"""
+                                        ?, ?, ?, ?, ?, ?)"""
     cur.execute(sql, new_props)
     func_id = cur.lastrowid
 
@@ -1203,7 +1271,11 @@ class CBinDiff:
       except KeyError:
         callgraph_all_primes[ret] = 1
       self.save_function(props)
-    
+
+      # Try to fix bug #30
+      if i % 1000 == 0:
+        self.db.commit()
+
     md5sum = GetInputFileMD5()
     self.save_callgraph(str(callgraph_primes), json.dumps(callgraph_all_primes), md5sum)
     self.export_structures()
@@ -1389,15 +1461,25 @@ class CBinDiff:
     if asm is None:
       return asm
 
+    # Ignore the comments in the assembly dump
     tmp = asm.split(";")[0]
-    tmp = asm.split(" # ")[0]
+    tmp = tmp.split(" # ")[0]
     # Now, replace sub_, byte_, word_, dword_, loc_, etc...
     for rep in CMP_REPS:
       tmp = re.sub(rep + "[a-f0-9A-F]+", "XXXX", tmp)
+
+    # Remove dword ptr, byte ptr, etc...
+    for rep in CMP_REMS:
+      tmp = re.sub(rep + "[a-f0-9A-F]+", "", tmp)
+
     reps = ["\+[a-f0-9A-F]+h\+"]
     for rep in reps:
       tmp = re.sub(rep, "+XXXX+", tmp)
     tmp = re.sub("\.\.[a-f0-9A-F]{8}", "XXX", tmp)
+    
+    # Strip any possible remaining white-space character at the end of
+    # the cleaned-up instruction
+    tmp = re.sub("[ \t\n]+$", "", tmp)
     return tmp
 
   def compare_graphs_pass(self, bblocks1, bblocks2, colours1, colours2, is_second = False):
@@ -1671,11 +1753,13 @@ class CBinDiff:
 
     try:
       show_wait_box("Updating primary database...")
+      total = 0
       for ea in to_import:
         ea = str(ea)
         new_func = self.read_function(ea)
         self.delete_function(ea)
         self.save_function(new_func)
+        total += 1
       self.db.commit()
     finally:
       hide_wait_box()
@@ -1812,23 +1896,21 @@ class CBinDiff:
         self.matched1.add(name)
         self.matched2.add(name)
 
-    if self.equal_callgraph and not self.ignore_all_names:
-      self.find_same_name(self.partial_chooser)
+    postfix = ""
+    if self.ignore_small_functions:
+      postfix = " and f.instructions > 5 and df.instructions > 5 "
 
-    sql = """select f.address, f.name, df.address, df.name, 'Equal pseudo-code' description
-               from functions f,
-                    diff.functions df
-              where f.pseudocode = df.pseudocode
-                and df.pseudocode is not null
-                and f.pseudocode_lines >= 5
-              union
-             select f.address, f.name, df.address, df.name, 'Equal assembly' description
-               from functions f,
-                    diff.functions df
-              where f.assembly = df.assembly
-                and df.assembly is not null
-              """
-    log_refresh("Finding with heuristic 'Equal assembly or pseudo-code'")
+    sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Function hash' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes,
+                     f.function_hash, df.function_hash
+                from functions f,
+                     diff.functions df
+               where f.function_hash = df.function_hash 
+                 and f.instructions > 5 and df.instructions > 5 """
+    log_refresh("Finding with heuristic 'Function hash'")
     self.add_matches_from_query(sql, choose)
 
     sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
@@ -1838,11 +1920,56 @@ class CBinDiff:
                      f.pseudocode_primes, df.pseudocode_primes
                 from functions f,
                      diff.functions df
-               where f.names = df.names
-                 and f.bytes_hash = df.bytes_hash
-                 and f.names != '[]'"""
+               where f.bytes_hash = df.bytes_hash
+                 and f.names = df.names
+                 and f.names != '[]'
+                 and f.instructions > 5 and df.instructions > 5"""
     log_refresh("Finding with heuristic 'Bytes hash and names'")
-    self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
+    self.add_matches_from_query(sql, choose)
+
+    sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Bytes hash' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes
+                from functions f,
+                     diff.functions df
+               where f.bytes_hash = df.bytes_hash
+                 and f.instructions > 5 and df.instructions > 5"""
+    log_refresh("Finding with heuristic 'Bytes hash'")
+    self.add_matches_from_query(sql, choose)
+
+    if not self.equal_callgraph and not self.ignore_all_names:
+      self.find_same_name(self.partial_chooser)
+
+    sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Bytes sum' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes
+                from functions f,
+                     diff.functions df
+               where f.bytes_sum = df.bytes_sum
+                 and f.size = df.size
+                 and f.instructions > 5 and df.instructions > 5"""
+    log_refresh("Finding with heuristic 'Bytes sum'")
+    self.add_matches_from_query(sql, choose)
+
+    sql = """select f.address, f.name, df.address, df.name, 'Equal pseudo-code' description
+               from functions f,
+                    diff.functions df
+              where f.pseudocode = df.pseudocode
+                and df.pseudocode is not null
+                and f.pseudocode_lines >= 5 """ + postfix + """
+              union
+             select f.address, f.name, df.address, df.name, 'Equal assembly' description
+               from functions f,
+                    diff.functions df
+              where f.assembly = df.assembly
+                and df.assembly is not null
+              """ + postfix
+    log_refresh("Finding with heuristic 'Equal assembly or pseudo-code'")
+    self.add_matches_from_query(sql, choose)
 
     sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
                      'Same cleaned up assembly or pseudo-code' description,
@@ -1852,7 +1979,7 @@ class CBinDiff:
                 from functions f,
                      diff.functions df
                where f.clean_assembly = df.clean_assembly
-                  or f.clean_pseudo = df.clean_pseudo"""
+                  or f.clean_pseudo = df.clean_pseudo""" + postfix
     log_refresh("Finding with heuristic 'Same cleaned up assembly or pseudo-code'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
@@ -1866,7 +1993,7 @@ class CBinDiff:
                 and f.instructions = df.instructions
                 and f.nodes = df.nodes
                 and f.edges = df.edges
-                and f.mnemonics = df.mnemonics"""
+                and f.mnemonics = df.mnemonics""" + postfix
     log_refresh("Finding with heuristic 'Same address, nodes, edges and mnemonics'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, None)
 
@@ -2220,8 +2347,9 @@ class CBinDiff:
   def find_matches(self):
     choose = self.partial_chooser
 
-    if not self.equal_callgraph and not self.ignore_all_names:
-      self.find_same_name(choose)
+    postfix = ""
+    if self.ignore_small_functions:
+      postfix = " and f.instructions > 5 and df.instructions > 5 "
 
     sql = """select f.address, f.name, df.address, df.name,
                     'All attributes' description,
@@ -2249,7 +2377,7 @@ class CBinDiff:
                 and f.strongly_connected = df.strongly_connected
                 and f.loops = df.loops
                 and f.tarjan_topological_sort = df.tarjan_topological_sort
-                and f.strongly_connected_spp = df.strongly_connected_spp
+                and f.strongly_connected_spp = df.strongly_connected_spp """ + postfix + """
               union 
              select f.address, f.name, df.address, df.name,
                     'Most attributes' description,
@@ -2273,9 +2401,21 @@ class CBinDiff:
                  and f.strongly_connected = df.strongly_connected
                  and f.loops = df.loops
                  and f.tarjan_topological_sort = df.tarjan_topological_sort
-                 and f.strongly_connected_spp = df.strongly_connected_spp"""
+                 and f.strongly_connected_spp = df.strongly_connected_spp """
+    sql += postfix
     log_refresh("Finding with heuristic 'All or most attributes'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser)
+
+    sql = """select f.address, f.name, df.address, df.name, 'Switch structures' description,
+                f.pseudocode, df.pseudocode,
+                f.assembly, df.assembly,
+                f.pseudocode_primes, df.pseudocode_primes
+           from functions f,
+                diff.functions df
+          where f.switches = df.switches
+            and df.switches != '[]' """ + postfix
+    log_refresh("Finding with heuristic 'Switch structures'")
+    self.add_matches_from_query_ratio_max(sql, self.partial_chooser, self.unreliable_chooser, 0.2)
 
     sql = """select f.address, f.name, df.address, df.name,
                     'Same address, nodes, edges and primes (re-ordered instructions)' description,
@@ -2289,7 +2429,7 @@ class CBinDiff:
                 and f.nodes = df.nodes
                 and f.edges = df.edges
                 and f.primes_value = df.primes_value
-                and f.nodes > 3"""
+                and f.nodes > 3""" + postfix
     log_refresh("Finding with heuristic 'Same address, nodes, edges and primes (re-ordered instructions)'")
     self.add_matches_from_query_ratio_max(sql, self.partial_chooser, self.unreliable_chooser, 0.5)
 
@@ -2304,7 +2444,7 @@ class CBinDiff:
                  and f.names != '[]'
                  and f.nodes = df.nodes
                  and f.edges = df.edges
-                 and f.instructions = df.instructions"""
+                 and f.instructions = df.instructions""" + postfix
     log_refresh("Finding with heuristic 'Import names hash'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser)
 
@@ -2325,7 +2465,7 @@ class CBinDiff:
                  and f.outdegree = df.outdegree
                  and f.nodes > 3
                  and f.edges > 3
-                 and f.names != '[]'
+                 and f.names != '[]'"""  + postfix + """
                union
               select f.address ea, f.name name1, df.address ea2, df.name name2,
                      'Nodes, edges, complexity, mnemonics, names and prototype2' description,
@@ -2340,7 +2480,7 @@ class CBinDiff:
                  and f.names = df.names
                  and f.names != '[]'
                  and f.cyclomatic_complexity = df.cyclomatic_complexity
-                 and f.prototype2 = df.prototype2"""
+                 and f.prototype2 = df.prototype2""" + postfix
     log_refresh("Finding with heuristic 'Nodes, edges, complexity, mnemonics, names, prototype, in-degree and out-degree'")
     self.add_matches_from_query_ratio(sql, self.partial_chooser, self.partial_chooser)
 
@@ -2354,7 +2494,7 @@ class CBinDiff:
                where f.mnemonics = df.mnemonics
                  and f.instructions = df.instructions
                  and f.names = df.names
-                 and f.names != '[]'"""
+                 and f.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Mnemonics and names'")
     self.add_matches_from_query_ratio(sql, choose, choose)
 
@@ -2385,7 +2525,7 @@ class CBinDiff:
                       diff.functions df
                 where df.pseudocode_hash1 = f.pseudocode_hash1
                    or df.pseudocode_hash2 = f.pseudocode_hash2
-                   or df.pseudocode_hash3 = f.pseudocode_hash3"""
+                   or df.pseudocode_hash3 = f.pseudocode_hash3""" + postfix
       log_refresh("Finding with heuristic 'Pseudo-code fuzzy hashes'")
       self.add_matches_from_query_ratio(sql, self.best_chooser, choose)
     else:
@@ -2395,7 +2535,7 @@ class CBinDiff:
                       f.pseudocode_primes, df.pseudocode_primes
                  from functions f,
                       diff.functions df
-                where df.pseudocode_hash1 = f.pseudocode_hash1"""
+                where df.pseudocode_hash1 = f.pseudocode_hash1""" + postfix
       log_refresh("Finding with heuristic 'Pseudo-code fuzzy hash'")
       self.add_matches_from_query_ratio(sql, self.best_chooser, choose)
 
@@ -2410,7 +2550,7 @@ class CBinDiff:
                 and df.names != '[]'
                 and df.pseudocode_lines > 5
                 and df.pseudocode is not null 
-                and f.pseudocode is not null"""
+                and f.pseudocode is not null""" + postfix
     log_refresh("Finding with heuristic 'Similar pseudo-code and names'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
@@ -2424,7 +2564,7 @@ class CBinDiff:
                 where f.pseudocode_lines = df.pseudocode_lines
                   and df.pseudocode_lines > 5
                   and df.pseudocode is not null 
-                  and f.pseudocode is not null"""
+                  and f.pseudocode is not null""" + postfix
       log_refresh("Finding with heuristic 'Similar pseudo-code'")
       self.add_matches_from_query_ratio_max(sql, choose, self.unreliable_chooser, 0.6)
 
@@ -2436,7 +2576,7 @@ class CBinDiff:
                     diff.functions df
               where df.pseudocode_primes = f.pseudocode_primes
                 and f.pseudocode_lines > 5
-                and length(f.pseudocode_primes) >= 35"""
+                and length(f.pseudocode_primes) >= 35""" + postfix
     log_refresh("Finding with heuristic 'Pseudo-code fuzzy AST hash'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, choose)
 
@@ -2449,7 +2589,7 @@ class CBinDiff:
                         diff.functions df
                   where substr(df.pseudocode_hash1, 1, 16) = substr(f.pseudocode_hash1, 1, 16)
                      or substr(df.pseudocode_hash2, 1, 16) = substr(f.pseudocode_hash2, 1, 16)
-                     or substr(df.pseudocode_hash3, 1, 16) = substr(f.pseudocode_hash3, 1, 16)"""
+                     or substr(df.pseudocode_hash3, 1, 16) = substr(f.pseudocode_hash3, 1, 16)""" + postfix
       log_refresh("Finding with heuristic 'Partial pseudo-code fuzzy hash'")
       self.add_matches_from_query_ratio_max(sql, choose, self.unreliable_chooser, 0.5)
 
@@ -2462,7 +2602,7 @@ class CBinDiff:
                     diff.functions df
               where f.strongly_connected = df.strongly_connected
                 and f.tarjan_topological_sort = df.tarjan_topological_sort
-                and f.strongly_connected > 3"""
+                and f.strongly_connected > 3""" + postfix
     log_refresh("Finding with heuristic 'Topological sort hash'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
@@ -2476,7 +2616,7 @@ class CBinDiff:
                   and f.cyclomatic_complexity = df.cyclomatic_complexity
                   and f.cyclomatic_complexity >= 20
                   and f.prototype2 = df.prototype2
-                  and df.names != '[]'"""
+                  and df.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Same high complexity, prototype and names'")
     self.add_matches_from_query_ratio(sql, choose, choose)
 
@@ -2489,7 +2629,7 @@ class CBinDiff:
                 where f.names = df.names
                   and f.cyclomatic_complexity = df.cyclomatic_complexity
                   and f.cyclomatic_complexity >= 15
-                  and df.names != '[]'"""
+                  and df.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Same high complexity and names'")
     self.add_matches_from_query_ratio_max(sql, choose, self.unreliable_chooser, 0.5)
 
@@ -2504,7 +2644,7 @@ class CBinDiff:
                   and df.strongly_connected > 1
                   and f.nodes > 5 and df.nodes > 5
                   and f.strongly_connected_spp > 1
-                  and df.strongly_connected_spp > 1"""
+                  and df.strongly_connected_spp > 1""" + postfix
       log_refresh("Finding with heuristic 'Strongly connected components'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.80)
     else:
@@ -2518,7 +2658,7 @@ class CBinDiff:
                 and df.strongly_connected > 3
                 and f.nodes > 5 and df.nodes > 5
                 and f.strongly_connected_spp > 1
-                and df.strongly_connected_spp > 1"""
+                and df.strongly_connected_spp > 1""" + postfix
       log_refresh("Finding with heuristic 'Strongly connected components'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.80)
 
@@ -2531,7 +2671,7 @@ class CBinDiff:
                   diff.functions df
             where f.loops = df.loops
               and df.loops > 1
-              and f.nodes > 3 and df.nodes > 3"""
+              and f.nodes > 3 and df.nodes > 3""" + postfix
       log_refresh("Finding with heuristic 'Loop count'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.49)
 
@@ -2542,7 +2682,7 @@ class CBinDiff:
                  from functions f,
                       diff.functions df
                 where f.strongly_connected_spp = df.strongly_connected_spp
-                  and df.strongly_connected_spp > 1"""
+                  and df.strongly_connected_spp > 1""" + postfix
     log_refresh("Finding with heuristic 'Strongly connected components small-primes-product'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
@@ -2553,7 +2693,7 @@ class CBinDiff:
                  from functions f,
                       diff.functions df
                 where f.names = df.names
-                  and df.names != '[]'"""
+                  and df.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Same names and order'")
     self.add_matches_from_query_ratio(sql, choose, choose)
 
@@ -2567,12 +2707,17 @@ class CBinDiff:
               where f.nodes = df.nodes
                 and f.edges = df.edges
                 and f.strongly_connected = df.strongly_connected
-                and df.nodes > 4"""
+                and df.nodes > 4""" + postfix
     log_refresh("Finding with heuristic 'Same nodes, edges and strongly connected components'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, choose, self.unreliable_chooser)
 
   def find_experimental_matches(self):
     choose = self.unreliable_chooser
+    
+    postfix = ""
+    if self.ignore_small_functions:
+      postfix = " and f.instructions > 5 and df.instructions > 5 "
+
     if self.slow_heuristics:
       sql = """select distinct f.address, f.name, df.address, df.name, 'Similar small pseudo-code' description,
                       f.pseudocode, df.pseudocode,
@@ -2583,7 +2728,7 @@ class CBinDiff:
                 where f.pseudocode_lines = df.pseudocode_lines
                   and df.pseudocode_lines <= 5
                   and df.pseudocode is not null 
-                  and f.pseudocode is not null"""
+                  and f.pseudocode is not null""" + postfix
       log_refresh("Finding with heuristic 'Similar small pseudo-code'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, choose, 0.49)
 
@@ -2594,7 +2739,7 @@ class CBinDiff:
                  from functions f,
                       diff.functions df
                 where df.pseudocode_primes = f.pseudocode_primes
-                  and f.pseudocode_lines <= 5"""
+                  and f.pseudocode_lines <= 5""" + postfix
       log_refresh("Finding with heuristic 'Small pseudo-code fuzzy AST hash'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
 
@@ -2606,7 +2751,7 @@ class CBinDiff:
                     diff.functions df
               where f.pseudocode = df.pseudocode
                 and df.pseudocode is not null
-                and f.pseudocode_lines < 5"""
+                and f.pseudocode_lines < 5""" + postfix
     log_refresh("Finding with heuristic 'Equal small pseudo-code'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser)
 
@@ -2620,7 +2765,7 @@ class CBinDiff:
                   and f.cyclomatic_complexity = df.cyclomatic_complexity
                   and f.cyclomatic_complexity < 20
                   and f.prototype2 = df.prototype2
-                  and df.names != '[]'"""
+                  and df.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Same low complexity, prototype and names'")
     self.add_matches_from_query_ratio_max(sql, self.partial_chooser, choose, 0.5)
 
@@ -2633,7 +2778,7 @@ class CBinDiff:
                 where f.names = df.names
                   and f.cyclomatic_complexity = df.cyclomatic_complexity
                   and f.cyclomatic_complexity < 15
-                  and df.names != '[]'"""
+                  and df.names != '[]'""" + postfix
     log_refresh("Finding with heuristic 'Same low complexity and names'")
     self.add_matches_from_query_ratio_max(sql, self.partial_chooser, choose, 0.5)
   
@@ -2655,7 +2800,7 @@ class CBinDiff:
              and f.strongly_connected = df.strongly_connected
              and f.loops = df.loops
              and f.tarjan_topological_sort = df.tarjan_topological_sort
-             and f.strongly_connected_spp = df.strongly_connected_spp
+             and f.strongly_connected_spp = df.strongly_connected_spp""" + postfix + """
            order by
                  case when f.size = df.size then 1 else 0 end +
                  case when f.instructions = df.instructions then 1 else 0 end +
@@ -2674,6 +2819,10 @@ class CBinDiff:
   def find_unreliable_matches(self):
     choose = self.unreliable_chooser
 
+    postfix = ""
+    if self.ignore_small_functions:
+      postfix = " and f.instructions > 5 and df.instructions > 5 "
+
     if self.slow_heuristics:
       sql = """select f.address, f.name, df.address, df.name, 'Strongly connected components' description,
                       f.pseudocode, df.pseudocode,
@@ -2682,7 +2831,7 @@ class CBinDiff:
                  from functions f,
                       diff.functions df
                 where f.strongly_connected = df.strongly_connected
-                  and df.strongly_connected > 2"""
+                  and df.strongly_connected > 2""" + postfix
       log_refresh("Finding with heuristic 'Strongly connected components'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, choose, 0.54)
 
@@ -2693,21 +2842,9 @@ class CBinDiff:
              from functions f,
                   diff.functions df
             where f.loops = df.loops
-              and df.loops > 1"""
+              and df.loops > 1""" + postfix
       log_refresh("Finding with heuristic 'Loop count'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
-
-      sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
-                       'Bytes hash' description,
-                       f.pseudocode, df.pseudocode,
-                       f.assembly, df.assembly,
-                       f.pseudocode_primes, df.pseudocode_primes
-                  from functions f,
-                       diff.functions df
-                 where f.bytes_hash = df.bytes_hash
-                   and f.instructions = df.instructions"""
-      log_refresh("Finding with heuristic 'Bytes hash'")
-      self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
       sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
                        'Nodes, edges, complexity and mnemonics' description,
@@ -2720,7 +2857,7 @@ class CBinDiff:
                    and f.edges = df.edges
                    and f.mnemonics = df.mnemonics
                    and f.cyclomatic_complexity = df.cyclomatic_complexity
-                   and f.nodes > 1 and f.edges > 0"""
+                   and f.nodes > 1 and f.edges > 0""" + postfix
       log_refresh("Finding with heuristic 'Nodes, edges, complexity and mnemonics'")
       self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser)
 
@@ -2735,7 +2872,7 @@ class CBinDiff:
                    and f.edges = df.edges
                    and f.prototype2 = df.prototype2
                    and f.cyclomatic_complexity = df.cyclomatic_complexity
-                   and f.prototype2 != 'int()'"""
+                   and f.prototype2 != 'int()'""" + postfix
       log_refresh("Finding with heuristic 'Nodes, edges, complexity and prototype'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
 
@@ -2751,7 +2888,7 @@ class CBinDiff:
                    and f.cyclomatic_complexity = df.cyclomatic_complexity
                    and f.nodes > 3 and f.edges > 2
                    and f.indegree = df.indegree
-                   and f.outdegree = df.outdegree"""
+                   and f.outdegree = df.outdegree""" + postfix
       log_refresh("Finding with heuristic 'Nodes, edges, complexity, in-degree and out-degree'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
 
@@ -2765,7 +2902,7 @@ class CBinDiff:
                  where f.nodes = df.nodes
                    and f.edges = df.edges
                    and f.cyclomatic_complexity = df.cyclomatic_complexity
-                   and f.nodes > 1 and f.edges > 0"""
+                   and f.nodes > 1 and f.edges > 0""" + postfix
       log_refresh("Finding with heuristic 'Nodes, edges and complexity'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
 
@@ -2778,7 +2915,7 @@ class CBinDiff:
                 where df.pseudocode is not null 
                   and f.pseudocode is not null
                   and f.pseudocode_lines = df.pseudocode_lines
-                  and df.pseudocode_lines > 5"""
+                  and df.pseudocode_lines > 5""" + postfix
       log_refresh("Finding with heuristic 'Similar small pseudo-code'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, self.unreliable_chooser, 0.5)
 
@@ -2789,7 +2926,7 @@ class CBinDiff:
                    from functions f,
                         diff.functions df
                   where f.cyclomatic_complexity = df.cyclomatic_complexity
-                    and f.cyclomatic_complexity >= 50"""
+                    and f.cyclomatic_complexity >= 50""" + postfix
       log_refresh("Finding with heuristic 'Same high complexity'")
       self.add_matches_from_query_ratio(sql, self.partial_chooser, choose)
 
@@ -2968,6 +3105,7 @@ class BinDiffOptions:
     self.ida_subs = kwargs.get('ida_subs', True)
     self.ignore_sub_names = kwargs.get('ignore_sub_names', True)
     self.ignore_all_names = kwargs.get('ignore_all_names', False)
+    self.ignore_small_functions = kwargs.get('ignore_small_functions', False)
     # Enable, by default, exporting only function summaries for huge dbs.
     self.func_summaries_only = kwargs.get('func_summaries_only', total_functions > 100000)
 
@@ -3033,6 +3171,7 @@ def _diff_or_export(use_ui, **options):
     bd.ida_subs = opts.ida_subs
     bd.ignore_sub_names = opts.ignore_sub_names
     bd.ignore_all_names = opts.ignore_all_names
+    bd.ignore_small_functions = opts.ignore_small_functions
     bd.function_summaries_only = opts.func_summaries_only
     bd.max_processed_rows = MAX_PROCESSED_ROWS * max(total_functions / 20000, 1)
     bd.timeout = TIMEOUT_LIMIT * max(total_functions / 20000, 1)
