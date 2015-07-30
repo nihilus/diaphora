@@ -35,6 +35,7 @@ import sys
 import time
 import json
 import decimal
+import difflib
 import sqlite3
 import traceback
 
@@ -58,7 +59,7 @@ from jkutils.factor import (FACTORS_CACHE, difference, difference_ratio,
                             primesbelow as primes)
 
 #-----------------------------------------------------------------------
-VERSION_VALUE = "1.0.5"
+VERSION_VALUE = "1.0.7"
 COPYRIGHT_VALUE="Copyright(c) 2015 Joxean Koret"
 COMMENT_VALUE="Diaphora diffing plugin for IDA version %s" % VERSION_VALUE
 
@@ -68,8 +69,8 @@ PRTYPE_SEMI=0x0008
 # Used to clean-up the pseudo-code and assembly dumps in order to get
 # better comparison ratios
 CMP_REPS = ["loc_", "sub_", "qword_", "dword_", "byte_", "word_", "off_",
-            "unk_", "stru_", "dbl_", "locret_"]
-CMP_REMS = ["dword ptr ", "byte ptr ", "word ptr ", "qword ptr "]
+            "unk_", "stru_", "dbl_", "locret_", "short"]
+CMP_REMS = ["dword ptr ", "byte ptr ", "word ptr ", "qword ptr ", "short ptr"]
 
 # Messages
 MSG_RELAXED_RATIO_ENABLED = """AUTOHIDE DATABASE\n<b>Relaxed ratio calculations</b> will be enabled. It will ignore many small
@@ -266,6 +267,7 @@ class CChooser(Choose2):
       self.cmd_import_all_funcs = self.AddCommand("Import *all* data for sub_* functions")
       self.cmd_highlight_functions = self.AddCommand("Highlight matches")
       self.cmd_unhighlight_functions = self.AddCommand("Unhighlight matches")
+      self.cmd_save_results = self.AddCommand("Save diffing results")
     elif not self.show_commands and (self.cmd_show_asm is None or force):
       self.cmd_show_asm = self.AddCommand("Show assembly")
       self.cmd_show_pseudo = self.AddCommand("Show pseudo-code")
@@ -324,6 +326,11 @@ class CChooser(Choose2):
       name2 = item[4]
       log("Diff graph for 0x%x - 0x%x" % (ea1, ea2))
       self.bindiff.graph_diff(ea1, name1, ea2, name2)
+    elif cmd_id == self.cmd_save_results:
+      filename = AskFile(1, "*.diaphora", "Select the file to store diffing results")
+      if filename is not None:
+        self.bindiff.save_results(filename)
+
     return True
 
   def OnSelectionChange(self, sel_list):
@@ -544,6 +551,29 @@ def show_choosers():
     g_bindiff.show_choosers(True)
 
 #-----------------------------------------------------------------------
+def save_results():
+  global g_bindiff
+  if g_bindiff is not None:
+    filename = AskFile(1, "*.diaphora", "Select the file to store diffing results")
+    if filename is not None:
+      g_bindiff.save_results(filename)
+
+#-----------------------------------------------------------------------
+def load_results():
+  tmp_diff = CBinDiff(":memory:")
+  filename = AskFile(0, "*.diaphora", "Select the file to load diffing results")
+  if filename is not None:
+    tmp_diff.load_results(filename)
+
+#-----------------------------------------------------------------------
+def import_definitions():
+  tmp_diff = CBinDiff(":memory:")
+  filename = AskFile(0, "*.sqlite", "Select the file to import structures, unions and enumerations from")
+  if filename is not None:
+    if askyn_c(1, "HIDECANCEL\nDo you really want to import all structures, unions and enumerations?") == 1:
+      tmp_diff.import_definitions_only(filename)
+
+#-----------------------------------------------------------------------
 MAX_PROCESSED_ROWS = 1000000
 TIMEOUT_LIMIT = 60 * 3
 
@@ -639,6 +669,7 @@ class CBinDiff:
   def open_db(self):
     self.db = sqlite3.connect(self.db_name)
     self.db.text_factory = str
+    self.db.row_factory = sqlite3.Row
     self.create_schema()
 
   def db_cursor(self):
@@ -719,7 +750,9 @@ class CBinDiff:
                 disasm text,
                 mnemonic text,
                 comment1 text,
-                comment2 text) """
+                comment2 text,
+                name text,
+                type text) """
     cur.execute(sql)
 
     sql = "create index if not exists idx_instructions_address on instructions (address)"
@@ -835,6 +868,12 @@ class CBinDiff:
     sql = "create index if not exists idx_mnemonics_spp on functions(mnemonics_spp)"
     cur.execute(sql)
 
+    sql = "create index if not exists idx_clean_asm on functions(clean_assembly)"
+    cur.execute(sql)
+
+    sql = "create index if not exists idx_clean_pseudo on functions(clean_pseudo)"
+    cur.execute(sql)
+
     sql = "create index if not exists idx_switches on functions(switches)"
     cur.execute(sql)
 
@@ -845,6 +884,153 @@ class CBinDiff:
     cur.execute(sql)
 
     cur.close()
+
+  def attach_database(self, diff_db):
+    cur = self.db_cursor()
+    cur.execute('attach "%s" as diff' % diff_db)
+    cur.close()
+
+  def reinit(self, main_db, diff_db, create_choosers=True):
+    log("Main database '%s'." % main_db)
+    log("Diff database '%s'." % diff_db)
+
+    self.__init__(main_db)
+    self.attach_database(diff_db)
+
+    if create_choosers:
+      self.create_choosers()
+
+  def import_definitions_only(self, filename):
+    self.reinit(":memory:", filename)
+    self.import_til()
+    self.import_definitions()
+
+  def load_results(self, filename):
+    results_db = sqlite3.connect(filename)
+    results_db.text_factory = str
+    results_db.row_factory = sqlite3.Row
+
+    cur = results_db.cursor()
+    try:
+      sql = "select main_db, diff_db, version from config"
+      cur.execute(sql)
+      rows = cur.fetchall()
+      if len(rows) != 1:
+        Warning("Malformed results database!")
+        return False
+      
+      row = rows[0]
+      version = row["version"]
+      if version != VERSION_VALUE:
+        msg = "The version of the diff results is %s and current version is %s, there can be some incompatibilities."
+        Warning(msg % (version, VERSION_VALUE))
+
+      main_db = row["main_db"]
+      diff_db = row["diff_db"]
+      if not os.path.exists(main_db):
+        log("Primary database %s not found." % main_db)
+        main_db = AskFile(0, main_db, "Select the primary database path")
+        if main_db is None:
+          return False
+      
+      if not os.path.exists(diff_db):
+        diff_db = AskFile(0, main_db, "Select the secondary database path")
+        if diff_db is None:
+          return False
+      
+      self.reinit(main_db, diff_db)
+
+      sql = "select * from results"
+      cur.execute(sql)
+      for row in cur.fetchall():
+        if row["type"] == "best":
+          choose = self.best_chooser
+        elif row["type"] == "partial":
+          choose = self.partial_chooser
+        else:
+          choose = self.unreliable_chooser
+
+        ea1 = int(row["address"], 16)
+        name1 = row["name"]
+        ea2 = int(row["address2"], 16)
+        name2 = row["name2"]
+        desc = row["description"]
+        ratio = float(row["ratio"])
+        choose.add_item(CChooser.Item(ea1, name1, ea2, name2, desc, ratio))
+      
+      sql = "select * from unmatched"
+      cur.execute(sql)
+      for row in cur.fetchall():
+        if row["type"] == "primary":
+          choose = self.unmatched_primary
+        else:
+          choose = self.unmatched_second
+        choose.add_item(CChooser.Item(int(row["address"], 16), row["name"]))
+
+      log("Showing diff results.")
+      self.show_choosers()
+      return True
+    finally:
+      cur.close()
+      results_db.close()
+
+    return False
+
+  def save_results(self, filename):
+    if os.path.exists(filename):
+      os.remove(filename)
+      log("Previous diff results '%s' removed." % filename)
+
+    results_db = sqlite3.connect(filename)
+    results_db.text_factory = str
+
+    cur = results_db.cursor()
+    try:
+      sql = "create table config (main_db text, diff_db text, version text, date text)"
+      cur.execute(sql)
+
+      sql = "insert into config values (?, ?, ?, ?)"
+      cur.execute(sql, (self.db_name, self.last_diff_db, VERSION_VALUE, time.asctime()))
+
+      sql = "create table results (type, line, address, name, address2, name2, ratio, description)"
+      cur.execute(sql)
+
+      sql = "create table unmatched (type, line, address, name)"
+      cur.execute(sql)
+
+      with results_db:
+        results_sql   = "insert into results values (?, ?, ?, ?, ?, ?, ?, ?)"
+        unmatched_sql = "insert into unmatched values (?, ?, ?, ?)"
+
+        for item in self.best_chooser.items:
+          l = list(item)
+          l.insert(0, 'best')
+          cur.execute(results_sql, l)
+        
+        for item in self.partial_chooser.items:
+          l = list(item)
+          l.insert(0, 'partial')
+          cur.execute(results_sql, l)
+
+        for item in self.unreliable_chooser.items:
+          l = list(item)
+          l.insert(0, 'unreliable')
+          cur.execute(results_sql, l)
+        
+        for item in self.unmatched_primary.items:
+          l = list(item)
+          l.insert(0, 'primary')
+          cur.execute(unmatched_sql, l)
+
+        for item in self.unmatched_second.items:
+          l = list(item)
+          l.insert(0, 'secondary')
+          cur.execute(unmatched_sql, l)
+
+      log("Diffing results saved in file '%s'." % filename)
+    finally:
+      cur.close()
+      results_db.close()
 
   def add_program_data(self, type_name, key, value):
     cur = self.db_cursor()
@@ -859,6 +1045,9 @@ class CBinDiff:
     demangled_name = Demangle(name, INF_SHORT_DN)
     if demangled_name is not None:
       name = demangled_name
+    
+    # Always remove the first underscores
+    name = name.lstrip("_")
 
     f = int(f)
     func = get_func(f)
@@ -881,7 +1070,6 @@ class CBinDiff:
     mnems = []
     dones = {}
     names = set()
-    
     bytes_hash = []
     bytes_sum = 0
     function_hash = []
@@ -912,6 +1100,7 @@ class CBinDiff:
         mnem = GetMnem(x)
         disasm = GetDisasm(x)
         size += ItemSize(x)
+        instructions += 1
 
         if mnem in cpu_ins_list:
           mnemonics_spp += self.primes[cpu_ins_list.index(mnem)]
@@ -924,17 +1113,20 @@ class CBinDiff:
           else:
             assembly[block_ea] = ["loc_%x:" % x, disasm]
 
-        instructions += 1
         
         decoded_size = idaapi.decode_insn(x)
-        if idaapi.cmd.Operands[0].type in [2, 5, 6, 7]:
+        if idaapi.cmd.Operands[0].type in [o_mem, o_imm, o_far, o_near, o_displ]:
           decoded_size -= idaapi.cmd.Operands[0].offb
-        if idaapi.cmd.Operands[1].type in [2, 5, 6, 7]:
+        if idaapi.cmd.Operands[1].type in [o_mem, o_imm, o_far, o_near, o_displ]:
           decoded_size -= idaapi.cmd.Operands[1].offb
         if decoded_size <= 0:
           decoded_size = 1
 
         curr_bytes = GetManyBytes(x, decoded_size)
+        if curr_bytes is None or len(curr_bytes) != decoded_size:
+            log("Failed to read %d bytes at [%08x]" % (decoded_size, x))
+            continue
+        
         bytes_hash.append(curr_bytes)
         bytes_sum += sum(map(ord, curr_bytes))
 
@@ -945,6 +1137,7 @@ class CBinDiff:
         if op_value == BADADDR:
           op_value = GetOperandValue(x, 0)
 
+        tmp_name = None
         if op_value != BADADDR and op_value in self.names:
           tmp_name = self.names[op_value]
           demangled_name = Demangle(name, INF_SHORT_DN)
@@ -953,14 +1146,23 @@ class CBinDiff:
           if not tmp_name.startswith("sub_"):
             names.add(tmp_name)
 
+        l = list(CodeRefsFrom(x, 0))
+        if len(l) == 0:
+          l = DataRefsFrom(x)
+
+        tmp_type = None
+        for ref in l:
+          if ref in self.names:
+            tmp_name = self.names[ref]
+            tmp_type = GetType(ref)
+
         ins_cmt1 = GetCommentEx(x, 0)
         ins_cmt2 = GetCommentEx(x, 1)
-        instructions_data.append([x - image_base, mnem, disasm, ins_cmt1, ins_cmt2])
+        instructions_data.append([x - image_base, mnem, disasm, ins_cmt1, ins_cmt2, tmp_name, tmp_type])
 
         switch = get_switch_info_ex(x)
         if switch:
           switch_cases = switch.get_jtable_size()
-          switch_low_case = switch.lowcase
           results = calc_switch_cases(x, switch)
 
           # It seems that IDAPython for idaq64 has some bug when reading
@@ -1147,16 +1349,16 @@ class CBinDiff:
     if not self.function_summaries_only:
       bb_data, bb_relations = props[len(props)-2:]
       instructions_ids = {}
-      sql = """insert into main.instructions (address, mnemonic, disasm, comment1, comment2)
-                                 values (?, ?, ?, ?, ?)"""
+      sql = """insert into main.instructions (address, mnemonic, disasm, comment1, comment2, name, type)
+                                 values (?, ?, ?, ?, ?, ?, ?)"""
       self_get_instruction_id = self.get_instruction_id
       cur_execute = cur.execute
       for key in bb_data:
         for insn in bb_data[key]:
-          addr, mnem, disasm, cmt1, cmt2 = insn
+          addr, mnem, disasm, cmt1, cmt2, name, mtype = insn
           db_id = self_get_instruction_id(str(addr))
           if db_id is None:
-            cur_execute(sql, (str(addr), mnem, disasm, cmt1, cmt2))
+            cur_execute(sql, (str(addr), mnem, disasm, cmt1, cmt2, name, mtype))
             db_id = cur.lastrowid
           instructions_ids[addr] = db_id
 
@@ -1203,6 +1405,15 @@ class CBinDiff:
     cur.execute(sql, (primes, all_primes, md5sum))
     cur.close()
 
+  def GetLocalType(self, ordinal, flags):
+    ret = GetLocalTinfo(ordinal)
+    if ret is not None:
+      (stype, fields) = ret
+      if stype:
+        name = GetLocalTypeName(ordinal)
+        return idc_print_type(stype, fields, name, flags)
+    return ""
+
   def export_structures(self):
     # It seems that GetMaxLocalType, sometimes, can return negative
     # numbers, according to one beta-tester. My guess is that it's a bug
@@ -1214,15 +1425,23 @@ class CBinDiff:
       return
 
     for i in range(local_types):
-      try:
-        name = GetLocalTypeName(i+1)
-        definition = GetLocalType(i+1, PRTYPE_MULTI|PRTYPE_TYPE|PRTYPE_SEMI|PRTYPE_PRAGMA)
-        type_name = "struct"
-        if definition.startswith("enum"):
-          type_name = "enum"
-        self.add_program_data(type_name, name, definition)
-      except:
-        pass
+      name = GetLocalTypeName(i+1)
+      definition = self.GetLocalType(i+1, PRTYPE_MULTI | PRTYPE_TYPE | PRTYPE_SEMI | PRTYPE_PRAGMA)
+      type_name = "struct"
+      if definition.startswith("enum"):
+        type_name = "enum"
+      elif definition.startswith("union"):
+        type_name = "union"
+
+      # For some reason, IDA my return types with the form "__int128 unsigned",
+      # we want it the right way "unsigned __int128".
+      if name and name.find(" ") > -1:
+        names = name.split(" ")
+        name = names[0]
+        if names[1] == "unsigned":
+          name = "unsigned %s" % name
+
+      self.add_program_data(type_name, name, definition)
 
   def get_til_names(self):
     idb_path = GetIdbPath()
@@ -1310,7 +1529,7 @@ class CBinDiff:
     """ Try to get a valid structure definition by removing (yes) the 
         invalid characters typically found in IDA's generated structs."""
     ret = defs.replace("?", "_").replace("@", "_")
-    ret = ret.replace("$", "_")
+    ret = ret.replace("$", "_").replace("#", "_")
     return ret
 
   def import_definitions(self):
@@ -1321,10 +1540,17 @@ class CBinDiff:
 
     new_rows = set()
     for row in rows:
-      if GetStrucIdByName(row[1]) == BADADDR:
+      if row[1] is None:
+        continue
+
+      the_name = row[1].split(" ")[0]
+      if GetStrucIdByName(the_name) == BADADDR:
         type_name = "struct"
         if row[0] == "enum":
           type_name = "enum"
+        elif row[0] == "union":
+          type_name == "union"
+
         new_rows.add(row)
         ret = ParseTypes("%s %s;" % (type_name, row[1]))
         if ret != 0:
@@ -1332,7 +1558,11 @@ class CBinDiff:
 
     for i in xrange(10):
       for row in new_rows:
-        if GetStrucIdByName(row[1]) == BADADDR:
+        if row[1] is None:
+          continue
+
+        the_name = row[1].split(" ")[0]
+        if GetStrucIdByName(the_name) == BADADDR and GetStrucIdByName(row[1]) == BADADDR:
           definition = self.get_valid_definition(row[2])
           ret = ParseTypes(definition)
           if ret != 0:
@@ -1455,6 +1685,7 @@ class CBinDiff:
       tmp = re.sub(rep + "[a-f0-9A-F]+", rep + "XXXX", tmp)
     tmp = re.sub("v[0-9]+", "vXXX", tmp)
     tmp = re.sub("a[0-9]+", "aXXX", tmp)
+    tmp = re.sub("arg_[0-9]+", "aXXX", tmp)
     return tmp
 
   def get_cmp_asm(self, asm):
@@ -1650,7 +1881,7 @@ class CBinDiff:
     sql = sql % db
     cur.execute(sql, (str(ea), ))
     row = cur.fetchone()
-    if row is None:
+    if row is None or row[0] is None or row[1] is None:
       Warning("Sorry, there is no pseudo-code available for the selected function.")
     else:
       fmt = HtmlFormatter()
@@ -1702,6 +1933,131 @@ class CBinDiff:
     cur.execute("delete from functions where address = ?", (ea, ))
     cur.close()
 
+  def is_auto_generated(self, name):
+    for rep in CMP_REPS:
+      if name.startswith(rep):
+        return True
+    return False
+
+  def import_instruction(self, ins_data1, ins_data2):
+    ea1 = self.get_base_address() + int(ins_data1[0])
+    ea2, cmt1, cmt2, name, mtype = ins_data2
+    # Set instruction level comments
+    if cmt1 is not None and get_cmt(ea1, 0) is None:
+      set_cmt(ea1, cmt1, 0)
+
+    if cmt2 is not None and get_cmt(ea1, 1) is None:
+      set_cmt(ea1, cmt1, 1)
+
+    tmp_ea = None
+    set_type = False
+    data_refs = list(DataRefsFrom(ea1))
+    if len(data_refs) > 0:
+      # Global variables
+      tmp_ea = data_refs[0]
+      if tmp_ea in self.names:
+        curr_name = GetTrueName(tmp_ea)
+        if curr_name != name and self.is_auto_generated(curr_name):
+          MakeName(tmp_ea, name)
+          set_type = False
+      else:
+        MakeName(tmp_ea, name)
+        set_type = True
+    else:
+      # Functions
+      code_refs = list(CodeRefsFrom(ea1, 0))
+      if len(code_refs) == 0:
+        code_refs = list(CodeRefsFrom(ea1, 1))
+
+      if len(code_refs) > 0:
+        curr_name = GetTrueName(code_refs[0])
+        if curr_name != name and self.is_auto_generated(curr_name):
+          MakeName(code_refs[0], name)
+          tmp_ea = code_refs[0]
+          set_type = True
+
+    if tmp_ea is not None and set_type:
+      if mtype is not None and GetType(tmp_ea) != mtype:
+        SetType(tmp_ea, mtype)
+
+  def import_instruction_level(self, ea1, ea2, cur):
+    cur = self.db_cursor()
+    try:
+      # Check first if we have any importable items
+      sql = """ select ins.address ea, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type
+                  from diff.function_bblocks bb,
+                       diff.functions f,
+                       diff.bb_instructions bbi,
+                       diff.instructions ins
+                 where f.id = bb.function_id
+                   and bbi.basic_block_id = bb.basic_block_id
+                   and ins.id = bbi.instruction_id
+                   and f.address = ?
+                   and (ins.comment1 is not null
+                     or ins.comment2 is not null
+                     or ins.name is not null) """
+      cur.execute(sql, (ea2,))
+      import_rows = cur.fetchall()
+      if len(import_rows) > 0:
+        import_syms = {}
+        for row in import_rows:
+          import_syms[row["dis"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"]]
+
+        # Check in the current database
+        sql = """ select ins.address ea, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type
+                    from function_bblocks bb,
+                         functions f,
+                         bb_instructions bbi,
+                         instructions ins
+                   where f.id = bb.function_id
+                     and bbi.basic_block_id = bb.basic_block_id
+                     and ins.id = bbi.instruction_id
+                     and f.address = ?"""
+        cur.execute(sql, (ea1,))
+        match_rows = cur.fetchall()
+        if len(match_rows) > 0:
+          matched_syms = {}
+          for row in match_rows:
+            matched_syms[row["dis"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"]]
+
+          # We have 'something' to import, let's diff the assembly...
+          sql = """select *
+                     from (
+                   select assembly, 1
+                     from functions
+                    where address = ?
+                      and assembly is not null
+             union select assembly, 2
+                     from diff.functions
+                    where address = ?
+                      and assembly is not null)
+                    order by 2 asc"""
+          cur.execute(sql, (ea1, ea2))
+          diff_rows = cur.fetchall()
+          if len(diff_rows) > 0:
+            lines1 = diff_rows[0][0]
+            lines2 = diff_rows[1][0]
+
+            matches = {}
+            to_line = None
+            change_line = None
+            diff_list = difflib.ndiff(lines1.splitlines(1), lines2.splitlines(1))
+            for x in diff_list:
+              if x[0] == '-':
+                change_line = x[1:].strip(" ").strip("\r").strip("\n")
+              elif x[0] == '+':
+                to_line = x[1:].strip(" ").strip("\r").strip("\n")
+              elif change_line is not None:
+                change_line = None
+
+              if to_line is not None and change_line is not None:
+                matches[change_line] = to_line
+                if change_line in matched_syms and to_line in import_syms:
+                  self.import_instruction(matched_syms[change_line], import_syms[to_line])
+                change_line = to_line = None
+    finally:
+      cur.close()
+
   def do_import_one(self, ea1, ea2, force = False):
     cur = self.db_cursor()
     sql = "select prototype, comment, mangled_function, function_flags from diff.functions where address = ?"
@@ -1728,6 +2084,8 @@ class CBinDiff:
 
       if flags is not None:
         SetFunctionFlags(ea1, flags)
+
+      self.import_instruction_level(ea1, ea2, cur)
 
     cur.close()
 
@@ -1901,6 +2259,38 @@ class CBinDiff:
       postfix = " and f.instructions > 5 and df.instructions > 5 "
 
     sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Same RVA and hash' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes,
+                     f.function_hash, df.function_hash
+                from functions f,
+                     diff.functions df
+               where df.rva = f.rva
+                 and df.bytes_hash = f.bytes_hash
+                 and df.instructions = f.instructions
+                 and ((f.name = df.name and substr(f.name, 1, 4) != 'sub_')
+                   or (substr(f.name, 1, 4) = 'sub_' or substr(df.name, 1, 4)))"""
+    log_refresh("Finding with heuristic 'Same RVA and hash'")
+    self.add_matches_from_query(sql, choose)
+
+    sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
+                     'Same order and hash' description,
+                     f.pseudocode, df.pseudocode,
+                     f.assembly, df.assembly,
+                     f.pseudocode_primes, df.pseudocode_primes,
+                     f.function_hash, df.function_hash
+                from functions f,
+                     diff.functions df
+               where df.id = f.id
+                 and df.bytes_hash = f.bytes_hash
+                 and df.instructions = f.instructions
+                 and ((f.name = df.name and substr(f.name, 1, 4) != 'sub_')
+                   or (substr(f.name, 1, 4) = 'sub_' or substr(df.name, 1, 4)))"""
+    log_refresh("Finding with heuristic 'Same order and hash'")
+    self.add_matches_from_query(sql, choose)
+
+    sql = """ select distinct f.address ea, f.name name1, df.address ea2, df.name name2,
                      'Function hash' description,
                      f.pseudocode, df.pseudocode,
                      f.assembly, df.assembly,
@@ -2069,8 +2459,6 @@ class CBinDiff:
       tmp2 = self.get_cmp_pseudo_lines(pseudo2)
       if tmp1 == "" or tmp2 == "":
         log("Error cleaning pseudo-code!")
-        print tmp1
-        print tmp2
       else:
         v1 = fratio(tmp1, tmp2)
         v1 = float(decimal_values.format(v1))
@@ -2344,6 +2732,130 @@ class CBinDiff:
         self.matched2.add(name2)
         self.matched2.add(name2_1)
 
+  def get_function_id(self, name, primary=True):
+    cur = self.db_cursor()
+    rid = None
+    db_name = "main"
+    if not primary:
+      db_name = "diff"
+
+    try:
+      sql = "select id from %s.functions where name = ?" % db_name
+      cur.execute(sql, (name,))
+      row = cur.fetchone()
+      if row:
+        rid = row[0]
+    finally:
+      cur.close()
+    
+    return rid
+
+  def find_matches_in_hole(self, last, item, row):
+    cur = self.db_cursor()
+    try:
+
+      postfix = ""
+      if self.ignore_small_functions:
+        postfix = " and instructions > 5"
+
+      desc = "Call address sequence"
+      id1 = row["id1"]
+      id2 = row["id2"]
+      sql = """ select * from functions where id = ? """ + postfix + """
+                union all 
+                select * from diff.functions where id = ? """ + postfix
+
+      thresold = min(0.6, float(item[5]))
+      done = False
+      for j in range(0, min(10, id1 - last)):
+        if done:
+          break
+
+        for i in range(0, min(10, id1 - last)):
+          if done:
+            break
+
+          cur.execute(sql, (id1+j, id2+i))
+          rows = cur.fetchall()
+          if len(rows) == 2:
+            name1 = rows[0]["name"]
+            name2 = rows[1]["name"]
+            if name1 in self.matched1 or name2 in self.matched2:
+              continue
+
+            r = self.check_ratio(rows[0]["pseudocode_primes"], rows[1]["pseudocode_primes"], \
+                                 rows[0]["pseudocode"], rows[1]["pseudocode"], \
+                                 rows[0]["assembly"], rows[1]["assembly"])
+            if r < 0.5:
+              if rows[0]["names"] != "[]" and rows[0]["names"] == rows[1]["names"]:
+                r = 0.5001
+
+            if r > thresold:
+              ea = rows[0]["address"]
+              ea2 = rows[1]["address"]
+              if r == 1:
+                self.best_chooser.add_item(CChooser.Item(ea, name1, ea2, name2, desc, r))
+                self.matched1.add(name1)
+                self.matched2.add(name2)
+              elif r > 0.5:
+                self.partial_chooser.add_item(CChooser.Item(ea, name1, ea2, name2, desc, r))
+                self.matched1.add(name1)
+                self.matched2.add(name2)
+              else:
+                self.unreliable_chooser.add_item(CChooser.Item(ea, name1, ea2, name2, desc, r))
+                self.matched1.add(name1)
+                self.matched2.add(name2)
+    finally:
+      cur.close()
+
+  def find_from_matches(self, the_items):
+    # XXX: FIXME: This is wrong in many ways, but still works... FIX IT!
+    # Rule 1: if a function A in program P is has id X and function B in
+    # the same program is has id + 1, then, in program P2, function B
+    # maybe the next function to A in P2.
+
+    log_refresh("Finding with heuristic 'Call address sequence'")
+    cur = self.db_cursor()
+    try:
+      # Create a copy of all the functions
+      cur.execute("create temporary table best_matches (id, id1, ea1, name1, id2, ea2, name2)")
+
+      # Insert each matched function into the temporary table
+      i = 0
+      for match in the_items:
+        ea1 = match[1]
+        name1 = match[2]
+        ea2 = match[3]
+        name2 = match[4]
+        id1 = self.get_function_id(name1)
+        id2 = self.get_function_id(name2, False)
+        sql = """insert into best_matches (id, id1, ea1, name1, id2, ea2, name2)
+                                   values (?, ?, ?, ?, ?, ?, ?)"""
+        cur.execute(sql, (i, id1, ea1, name1, id2, ea2, name2))
+        i += 1
+
+      last = None
+      cur.execute("select * from best_matches order by id1 asc")
+      for row in cur:
+        row_id = row["id1"]
+        if last is None or last+1 == row_id:
+          last = row_id
+          continue
+
+        item = the_items[row["id"]]
+        self.find_matches_in_hole(last, item, row)
+        last = row_id
+
+      cur.execute("drop table best_matches")
+    finally:
+      cur.close()
+
+    # Rule 2: given a match for a function F in programs P & P2, find
+    # parents and children of the matched function using the parents and
+    # children of program P.
+    # TODO: Implement it.
+    pass
+
   def find_matches(self):
     choose = self.partial_chooser
 
@@ -2575,7 +3087,7 @@ class CBinDiff:
                from functions f,
                     diff.functions df
               where df.pseudocode_primes = f.pseudocode_primes
-                and f.pseudocode_lines > 5
+                and f.pseudocode_lines > 3
                 and length(f.pseudocode_primes) >= 35""" + postfix
     log_refresh("Finding with heuristic 'Pseudo-code fuzzy AST hash'")
     self.add_matches_from_query_ratio(sql, self.best_chooser, choose)
@@ -2647,20 +3159,17 @@ class CBinDiff:
                   and df.strongly_connected_spp > 1""" + postfix
       log_refresh("Finding with heuristic 'Strongly connected components'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.80)
-    else:
-      sql = """select f.address, f.name, df.address, df.name, 'Strongly connected components' description,
-                    f.pseudocode, df.pseudocode,
-                    f.assembly, df.assembly,
-                    f.pseudocode_primes, df.pseudocode_primes
-               from functions f,
-                    diff.functions df
-              where f.strongly_connected = df.strongly_connected
-                and df.strongly_connected > 3
-                and f.nodes > 5 and df.nodes > 5
-                and f.strongly_connected_spp > 1
-                and df.strongly_connected_spp > 1""" + postfix
-      log_refresh("Finding with heuristic 'Strongly connected components'")
-      self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.80)
+
+    sql = """  select f.address, f.name, df.address, df.name, 'Strongly connected components small-primes-product' description,
+                      f.pseudocode, df.pseudocode,
+                      f.assembly, df.assembly,
+                      f.pseudocode_primes, df.pseudocode_primes
+                 from functions f,
+                      diff.functions df
+                where f.strongly_connected_spp = df.strongly_connected_spp
+                  and df.strongly_connected_spp > 1""" + postfix
+    log_refresh("Finding with heuristic 'Strongly connected components small-primes-product'")
+    self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
     if self.slow_heuristics:
       sql = """select f.address, f.name, df.address, df.name, 'Loop count' description,
@@ -2674,17 +3183,6 @@ class CBinDiff:
               and f.nodes > 3 and df.nodes > 3""" + postfix
       log_refresh("Finding with heuristic 'Loop count'")
       self.add_matches_from_query_ratio_max(sql, self.partial_chooser, None, 0.49)
-
-    sql = """  select f.address, f.name, df.address, df.name, 'Strongly connected components small-primes-product' description,
-                      f.pseudocode, df.pseudocode,
-                      f.assembly, df.assembly,
-                      f.pseudocode_primes, df.pseudocode_primes
-                 from functions f,
-                      diff.functions df
-                where f.strongly_connected_spp = df.strongly_connected_spp
-                  and df.strongly_connected_spp > 1""" + postfix
-    log_refresh("Finding with heuristic 'Strongly connected components small-primes-product'")
-    self.add_matches_from_query_ratio(sql, self.best_chooser, self.partial_chooser, self.unreliable_chooser)
 
     sql = """  select f.address, f.name, df.address, df.name, 'Same names and order' description,
                       f.pseudocode, df.pseudocode,
@@ -2713,6 +3211,10 @@ class CBinDiff:
 
   def find_experimental_matches(self):
     choose = self.unreliable_chooser
+    
+    # Call address sequence heuristic
+    self.find_from_matches(self.best_chooser.items)
+    self.find_from_matches(self.partial_chooser.items)
     
     postfix = ""
     if self.ignore_small_functions:
@@ -2970,6 +3472,9 @@ class CBinDiff:
     self.partial_chooser = CChooser("Partial matches", self)
     self.best_chooser = CChooser("Best matches", self)
 
+    self.unmatched_second = CChooser("Unmatched in secondary", self, False)
+    self.unmatched_primary = CChooser("Unmatched in primary", self, False)
+
   def show_choosers(self, force=False):
     if len(self.best_chooser.items) > 0:
       self.best_chooser.show(force)
@@ -2988,6 +3493,8 @@ class CBinDiff:
     g_bindiff = self
 
     idaapi.add_menu_item("Edit/Plugins/", "Diaphora - Show results", "F3", 0, show_choosers, ())
+    idaapi.add_menu_item("Edit/Plugins/", "Diaphora - Save results", None, 0, save_results, ())
+    idaapi.add_menu_item("Edit/Plugins/", "Diaphora - Load results", None, 0, load_results, ())
     Warning("""AUTOHIDE REGISTRY\nIf you close one tab you can always re-open it by pressing F3
 or selecting Edit -> Plugins -> Diaphora - Show results""")
 
@@ -3202,9 +3709,11 @@ def _diff_or_export(use_ui, **options):
 
   return bd
 
+#-----------------------------------------------------------------------
 def diff_or_export_ui():
   return _diff_or_export(True)
 
+#-----------------------------------------------------------------------
 def diff_or_export(**options):
   return _diff_or_export(False, **options)
 
